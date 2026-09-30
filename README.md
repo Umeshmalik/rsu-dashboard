@@ -1,6 +1,8 @@
 # RSU ledger
 
-A local-only dashboard for your E*TRADE RSUs. It shows vested, unvested, withheld for tax, and received shares, plus every future vest, in units, USD, and INR.
+A free, MIT-licensed calculator for your E*TRADE RSUs. Source: [Umeshmalik/rsu-dashboard](https://github.com/Umeshmalik/rsu-dashboard).
+
+It shows vested, unvested, withheld for tax, and received shares, plus every future vest, in units, USD, and INR.
 
 The app is a [T3](https://create.t3.gg) stack: Next.js, tRPC, Tailwind CSS, and TypeScript, installed with pnpm. Grants stay in this browser. The site does not keep a copy. The only requests it makes are a share-price lookup and the live USD/INR spot, the same interbank quote E*TRADE uses. Yahoo Finance is tried first; Nasdaq and CNBC are the share-price fallbacks. For the rupee rate, Yahoo is tried first, then the CNBC USD/INR spot, then Frankfurter and Stooq. A production visit caches the page, so later visits open with the last price when you are offline.
 

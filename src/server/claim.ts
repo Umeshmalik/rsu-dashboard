@@ -52,5 +52,9 @@ export async function claimLedger(): Promise<ClaimedLedger | null> {
 }
 
 export async function discardLedger(): Promise<void> {
-  await fs.rm(dataDir(), { recursive: true, force: true });
+  try {
+    await fs.rm(dataDir(), { recursive: true, force: true });
+  } catch {
+    /* no local ledger on this host */
+  }
 }

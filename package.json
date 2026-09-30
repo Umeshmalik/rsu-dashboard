@@ -2,12 +2,15 @@
   "name": "rsu-dashboard",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
-  "description": "Local-only RSU tracker for E*TRADE stock plan exports",
+  "description": "Free, open-source E*TRADE RSU calculator. Vested, unvested, tax-withheld, and future vests in units, USD, and INR. Grants stay in the browser.",
   "scripts": {
     "build": "next build",
     "dev": "next dev --turbo --hostname 127.0.0.1 --port 4280",
     "preview": "next build && next start --hostname 127.0.0.1 --port 4280",
+    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "cf-typegen": "wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts",
     "start": "next start --hostname 127.0.0.1 --port 4280",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
@@ -16,6 +19,7 @@
     "node": ">=18.18"
   },
   "dependencies": {
+    "@opennextjs/cloudflare": "^1.20.6",
     "@t3-oss/env-nextjs": "^0.12.0",
     "@tanstack/react-query": "^5.69.0",
     "@trpc/client": "^11.0.0",
@@ -38,7 +42,8 @@
     "postcss": "^8.5.3",
     "tailwindcss": "^4.0.15",
     "typescript": "^5.8.2",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "wrangler": "^4.141.0"
   },
   "ct3aMetadata": {
     "initVersion": "7.40.0"

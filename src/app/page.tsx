@@ -1,19 +1,12 @@
-"use client";
-
-import dynamic from "next/dynamic";
-
-const Dashboard = dynamic(
-  () => import("~/app/_components/dashboard").then((mod) => mod.Dashboard),
-  {
-    ssr: false,
-    loading: () => (
-      <main className="mx-auto max-w-270 px-5 pt-7 pb-16">
-        <div className="text-lg font-extrabold tracking-tight">RSU ledger</div>
-      </main>
-    ),
-  },
-);
+import { Ledger } from "~/app/_components/ledger";
+import { Reference, TrustStrip } from "~/app/_components/reference";
 
 export default function Home() {
-  return <Dashboard />;
+  return (
+    <>
+      <TrustStrip />
+      <Ledger />
+      <Reference />
+    </>
+  );
 }
