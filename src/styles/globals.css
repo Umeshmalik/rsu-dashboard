@@ -1,0 +1,26 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-public-sans), ui-sans-serif, system-ui, sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --color-paper: #f3f5f2;
+  --color-ink: #1f2a33;
+  --color-mute: #5d6b74;
+  --color-rule: #d5dbd6;
+  --color-card: #ffffff;
+  --color-got: #2e6e57;
+  --color-tax: #9c4a6b;
+  --color-pay: #b86a1a;
+  --color-fgot: #8dbfac;
+  --color-ftax: #ddb0c2;
+  --color-fpay: #e4c48a;
+  --color-gold: #b7801a;
+}
+
+body {
+  font-variant-numeric: tabular-nums;
+}
+
+table tbody tr:hover td {
+  background: #f7f9f7;
+}

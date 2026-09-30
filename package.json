@@ -1,0 +1,47 @@
+{
+  "name": "rsu-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-only RSU tracker for E*TRADE stock plan exports",
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev --turbo --hostname 127.0.0.1 --port 4280",
+    "preview": "next build && next start --hostname 127.0.0.1 --port 4280",
+    "start": "next start --hostname 127.0.0.1 --port 4280",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=18.18"
+  },
+  "dependencies": {
+    "@t3-oss/env-nextjs": "^0.12.0",
+    "@tanstack/react-query": "^5.69.0",
+    "@trpc/client": "^11.0.0",
+    "@trpc/react-query": "^11.0.0",
+    "@trpc/server": "^11.0.0",
+    "next": "^15.2.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^2.15.4",
+    "server-only": "^0.0.1",
+    "superjson": "^2.2.1",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.15",
+    "@types/node": "^20.14.10",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^4.0.15",
+    "typescript": "^5.8.2",
+    "vitest": "^3.2.4"
+  },
+  "ct3aMetadata": {
+    "initVersion": "7.40.0"
+  },
+  "packageManager": "pnpm@9.15.9"
+}
