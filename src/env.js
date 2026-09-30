@@ -8,8 +8,6 @@ export const env = createEnv({
    */
   server: {
     NODE_ENV: z.enum(["development", "test", "production"]),
-    RSU_DATA_DIR: z.string().min(1).optional(),
-    RSU_WATCH_DIR: z.string().min(1).optional(),
   },
 
   /**
@@ -25,8 +23,6 @@ export const env = createEnv({
    */
   runtimeEnv: {
     NODE_ENV: process.env.NODE_ENV,
-    RSU_DATA_DIR: process.env.RSU_DATA_DIR,
-    RSU_WATCH_DIR: process.env.RSU_WATCH_DIR,
   },
   /**
    * Run `build` or `dev` with `SKIP_ENV_VALIDATION` to skip env validation. This is especially

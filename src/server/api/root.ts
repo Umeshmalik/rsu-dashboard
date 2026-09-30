@@ -17,6 +17,6 @@ export type AppRouter = typeof appRouter;
  * Create a server-side caller for the tRPC API.
  * @example
  * const trpc = createCaller(createContext);
- * const res = await trpc.rsu.state();
+ * const res = await trpc.rsu.quote({ symbol: "EXPE", fresh: true });
  */
 export const createCaller = createCallerFactory(appRouter);

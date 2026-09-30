@@ -21,6 +21,28 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+button,
+a[href],
+summary,
+label,
+select,
+[role="button"],
+[role="tab"],
+input[type="checkbox"],
+input[type="radio"] {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled {
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-gold);
+  outline-offset: 2px;
+}
+
 table tbody tr:hover td {
   background: #f7f9f7;
 }

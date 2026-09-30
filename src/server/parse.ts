@@ -1,4 +1,3 @@
-import "server-only";
 import * as XLSX from "xlsx";
 
 import { iso, num, toDate, today0 } from "~/lib/rsu";
@@ -74,12 +73,12 @@ export interface SheetSummary {
   rows: number;
 }
 
-function workbook(buf: Buffer) {
-  return XLSX.read(buf, { type: "buffer", cellDates: true });
+function workbook(data: ArrayBuffer | Uint8Array) {
+  return XLSX.read(data, { type: "array", cellDates: true });
 }
 
-export function headerSummary(buf: Buffer): SheetSummary[] {
-  const wb = workbook(buf);
+export function headerSummary(data: ArrayBuffer | Uint8Array): SheetSummary[] {
+  const wb = workbook(data);
   return wb.SheetNames.map((name) => {
     const sheet = wb.Sheets[name];
     if (!sheet) return { sheet: name, headers: [], rows: 0 };
@@ -96,8 +95,8 @@ export function headerSummary(buf: Buffer): SheetSummary[] {
   });
 }
 
-export function parseFile(buf: Buffer): Grant[] {
-  const wb = workbook(buf);
+export function parseFile(data: ArrayBuffer | Uint8Array): Grant[] {
+  const wb = workbook(data);
   const grants: Record<string, Grant> = {};
   let order = 0;
   const ensure = (gn: string): Grant => {

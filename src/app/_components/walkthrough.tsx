@@ -7,8 +7,6 @@ const focus =
 
 export interface WalkthroughProps {
   open: boolean;
-  watchDir: string;
-  watching: boolean;
   onClose: () => void;
   onImport: () => void;
 }
@@ -33,9 +31,13 @@ const STEPS = [
     ],
   },
   {
-    title: "Give the file to this app",
-    body: "Either save it where the app is already watching, or pick it with Import file.",
-    points: [],
+    title: "Import it here",
+    body: "The workbook is read in this browser. It is not uploaded, and the grants stay on this device.",
+    points: [
+      "Click Import file and choose the .xlsx.",
+      "You can close the laptop's network after that. The ledger still opens.",
+      "Only the share price and USD/INR need a connection, and the last values stay until the next refresh.",
+    ],
   },
   {
     title: "Read the ledger",
@@ -44,18 +46,12 @@ const STEPS = [
       "In your account: shares that stayed after tax.",
       "Sold for tax: whole shares E*TRADE sold. Tax is taken out, and the leftover cash is paid in salary.",
       "Still to vest: what is left, with an estimate of the next sale.",
-      "Download a fresh sheet after a new vest or a new grant. The price and USD/INR refresh on their own.",
+      "Download a fresh sheet after a new vest or a new grant, then import it again.",
     ],
   },
 ] as const;
 
-export function Walkthrough({
-  open,
-  watchDir,
-  watching,
-  onClose,
-  onImport,
-}: WalkthroughProps) {
+export function Walkthrough({ open, onClose, onImport }: WalkthroughProps) {
   const [step, setStep] = useState(0);
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -79,19 +75,7 @@ export function Walkthrough({
 
   if (!open || !current) return null;
 
-  const savePoints =
-    step === 2
-      ? watching
-        ? [
-            `Save the .xlsx into ${watchDir}. It imports on its own.`,
-            "Or click Import file and choose the workbook yourself.",
-            "Leave the file name as E*TRADE saved it.",
-          ]
-        : [
-            "Click Import file and choose the .xlsx.",
-            "Folder watching is off on this machine, so a download alone will not import.",
-          ]
-      : current.points;
+  const savePoints = current.points;
 
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-[#1f2a33]/40 p-4 sm:items-center">

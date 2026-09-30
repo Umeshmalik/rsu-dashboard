@@ -1,20 +1,14 @@
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { TRPCClientError, createTRPCClient, httpBatchStreamLink } from "@trpc/client";
 import { NextRequest } from "next/server";
 import SuperJSON from "superjson";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as XLSX from "xlsx";
 
-import { GET as eventsGet } from "~/app/api/events/route";
+import { mergeGrants } from "~/lib/rsu";
 import { GET as trpcGet, POST as trpcPost } from "~/app/api/trpc/[trpc]/route";
 import type { AppRouter } from "~/server/api/root";
-import { parseFile } from "~/server/parse";
-import { resetStore } from "~/server/store";
-import { defaultSettings } from "~/lib/types";
-
-let dir = "";
+import { headerSummary, parseFile } from "~/server/parse";
+import { resetQuoteCache } from "~/server/market";
 
 function workbook(rows: Record<string, unknown>[], sheet = "Holdings"): Buffer {
   const wb = XLSX.utils.book_new();
@@ -56,48 +50,16 @@ function yahoo(price: number) {
   );
 }
 
-beforeEach(async () => {
-  dir = await fs.mkdtemp(path.join(os.tmpdir(), "rsu-api-"));
-  resetStore(dir);
+beforeEach(() => {
+  resetQuoteCache();
 });
 
-afterEach(async () => {
+afterEach(() => {
   vi.unstubAllGlobals();
-  resetStore(dir);
-  await fs.rm(dir, { recursive: true, force: true });
+  resetQuoteCache();
 });
 
-describe("rsu.state and rsu.save", () => {
-  it("starts empty and round-trips edits", async () => {
-    const api = client();
-    const initial = await api.rsu.state.query();
-    expect(initial.grants).toEqual([]);
-    expect(initial.settings.symbol).toBe("EXPE");
-    expect(initial.meta.dataFile).toBe(path.join(dir, "db.json"));
-    expect(initial.meta.watching).toBe(false);
-
-    const settings = { ...defaultSettings(), taxRate: 34.32, symbol: "EXPE" };
-    const saved = await api.rsu.save.mutate({ grants: [], settings });
-    expect(saved).toEqual({ ok: true });
-
-    const again = await api.rsu.state.query();
-    expect(again.settings.taxRate).toBe(34.32);
-    const backups = await fs.readdir(path.join(dir, "backups"));
-    expect(backups.some((name) => name.startsWith("db-"))).toBe(true);
-  });
-
-  it("rejects a settings payload that does not match the schema", async () => {
-    const api = client();
-    await expect(
-      api.rsu.save.mutate({
-        grants: [],
-        settings: { ...defaultSettings(), taxRate: "high" as unknown as number },
-      }),
-    ).rejects.toMatchObject({ data: { code: "BAD_REQUEST" } });
-  });
-});
-
-describe("rsu.importFile", () => {
+describe("workbook import", () => {
   const rows = [
     {
       "Record Type": "Grant",
@@ -127,76 +89,42 @@ describe("rsu.importFile", () => {
     },
   ];
 
-  it("imports an E*TRADE workbook and keeps hand-edited tax shares", async () => {
-    const api = client();
-    const dataBase64 = workbook(rows).toString("base64");
-    const imported = await api.rsu.importFile.mutate({
-      name: "ByBenefitType_expanded.xlsx",
-      dataBase64,
-    });
-    expect(imported.grants).toBe(1);
-    expect(imported.vests).toBe(3);
-    expect(imported.via).toBe("upload");
-
-    const state = await api.rsu.state.query();
-    expect(state.settings.symbol).toBe("MSFT");
-    const grant = state.grants[0];
-    expect(grant?.granted).toBe(30);
-    const past = grant?.vests.filter((v) => v.date < "2026-01-01") ?? [];
+  it("reads an E*TRADE workbook and keeps hand-edited tax shares", () => {
+    const buf = workbook(rows);
+    const parsed = parseFile(buf);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]?.vests).toHaveLength(3);
+    expect(parsed[0]?.symbol).toBe("MSFT");
+    expect(parsed[0]?.granted).toBe(30);
+    const past = parsed[0]?.vests.filter((v) => v.date < "2026-01-01") ?? [];
     expect(past.reduce((sum, v) => sum + (v.withheld ?? 0), 0)).toBe(9);
     expect(past.every((v) => v.src === "allocated")).toBe(true);
 
-    const edited = grant?.vests.map((v) =>
+    const grant = parsed[0];
+    if (!grant) return;
+    const edited = grant.vests.map((v) =>
       v.date === "2024-11-15" ? { ...v, withheld: 4, src: "edited" as const } : v,
     );
-    await api.rsu.save.mutate({
-      grants: [{ ...grant!, vests: edited! }],
-      settings: state.settings,
-    });
-    await api.rsu.importFile.mutate({ name: "again.xlsx", dataBase64 });
-    const after = await api.rsu.state.query();
-    expect(after.grants[0]?.vests[0]).toMatchObject({
+    const again = mergeGrants([{ ...grant, vests: edited }], parseFile(buf));
+    expect(again[0]?.vests[0]).toMatchObject({
       date: "2024-11-15",
       withheld: 4,
       src: "edited",
     });
   });
 
-  it("reports the columns when a workbook has no grants", async () => {
-    const api = client();
-    const dataBase64 = workbook([{ Note: "hello" }]).toString("base64");
-    try {
-      await api.rsu.importFile.mutate({ name: "empty.xlsx", dataBase64 });
-      expect.unreachable("import should fail");
-    } catch (e) {
-      expect(e).toBeInstanceOf(TRPCClientError);
-      const err = e as TRPCClientError<AppRouter>;
-      expect(err.data?.code).toBe("UNPROCESSABLE_CONTENT");
-      expect(err.message).toContain("No RSU grants");
-      const headers = (err.data as { headers?: { headers: string[] }[] } | null)
-        ?.headers;
-      expect(headers?.[0]?.headers).toContain("Note");
-    }
+  it("reports the columns when a workbook has no grants", () => {
+    const buf = workbook([{ Note: "hello" }]);
+    expect(parseFile(buf)).toEqual([]);
+    expect(headerSummary(buf)[0]?.headers).toContain("Note");
   });
 
-  it("rejects a file that is not a spreadsheet", async () => {
-    const api = client();
-    await expect(
-      api.rsu.importFile.mutate({
-        name: "notes.txt",
-        dataBase64: Buffer.from("not a spreadsheet").toString("base64"),
-      }),
-    ).rejects.toMatchObject({ data: { code: "UNPROCESSABLE_CONTENT" } });
+  it("finds no grants in a file that is not a spreadsheet", () => {
+    expect(parseFile(Buffer.from("not a spreadsheet"))).toEqual([]);
   });
 
-  it("rejects a workbook the parser cannot read", async () => {
-    const api = client();
-    await expect(
-      api.rsu.importFile.mutate({
-        name: "broken.xlsx",
-        dataBase64: Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00]).toString("base64"),
-      }),
-    ).rejects.toMatchObject({ data: { code: "BAD_REQUEST" } });
+  it("rejects a workbook the parser cannot read", () => {
+    expect(() => parseFile(Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00]))).toThrow();
   });
 
   it("skips ESPP sheets and spreads withheld shares", () => {
@@ -292,14 +220,13 @@ describe("rsu.quote", () => {
     });
     vi.stubGlobal("fetch", calls);
 
-    const first = await api.rsu.quote.mutate({ force: true });
+    const first = await api.rsu.quote.mutate({ symbol: "EXPE", fresh: true });
     expect(first.price).toBe(180.5);
     expect(first.usdinr).toBe(83.25);
     expect(first.asOf).toContain("Yahoo Finance");
-    expect(first.manualPrice).toBe(false);
     const used = calls.mock.calls.length;
 
-    const second = await api.rsu.quote.mutate({ force: false });
+    const second = await api.rsu.quote.mutate({ symbol: "EXPE", fresh: false });
     expect(second.price).toBe(180.5);
     expect(calls.mock.calls.length).toBe(used);
   });
@@ -329,12 +256,11 @@ describe("rsu.quote", () => {
       }
       return new Response("missing", { status: 404 });
     });
-    const quote = await api.rsu.quote.mutate({ force: true });
+    const quote = await api.rsu.quote.mutate({ symbol: "EXPE", fresh: true });
     expect(quote.price).toBe(266.495);
     expect(quote.usdinr).toBe(95.98);
     expect(quote.asOf).toContain("Nasdaq");
     expect(quote.asOf).toContain("Frankfurter");
-    expect(quote.manualPrice).toBe(false);
   });
 
   it("uses the CNBC dollar-rupee spot when Yahoo is rate limited", async () => {
@@ -372,7 +298,7 @@ describe("rsu.quote", () => {
       }
       return new Response("missing", { status: 404 });
     });
-    const quote = await api.rsu.quote.mutate({ force: true });
+    const quote = await api.rsu.quote.mutate({ symbol: "EXPE", fresh: true });
     expect(quote.price).toBe(266.33);
     expect(quote.usdinr).toBe(95.83);
     expect(quote.asOf).toContain("CNBC spot");
@@ -393,7 +319,7 @@ describe("rsu.quote", () => {
       }
       return new Response("missing", { status: 404 });
     });
-    const quote = await api.rsu.quote.mutate({ force: true });
+    const quote = await api.rsu.quote.mutate({ symbol: "EXPE", fresh: true });
     expect(quote.price).toBe(150.25);
     expect(quote.usdinr).toBe(83.5);
     expect(quote.asOf).toContain("Stooq");
@@ -402,73 +328,9 @@ describe("rsu.quote", () => {
   it("returns an error when both quote sources fail", async () => {
     const api = client();
     vi.stubGlobal("fetch", async () => new Response("no", { status: 503 }));
-    await expect(api.rsu.quote.mutate({ force: true })).rejects.toMatchObject({
+    await expect(api.rsu.quote.mutate({ symbol: "EXPE", fresh: true })).rejects.toMatchObject({
       message: "Couldn't get a price for EXPE",
       data: { code: "INTERNAL_SERVER_ERROR" },
     });
-  });
-
-  it("keeps a typed-in price until a forced refresh", async () => {
-    const api = client();
-    await api.rsu.save.mutate({
-      grants: [],
-      settings: { ...defaultSettings(), price: 10, usdinr: 80, manualPrice: true },
-    });
-    const fetchSpy = vi.fn(async () => new Response("no", { status: 503 }));
-    vi.stubGlobal("fetch", fetchSpy);
-    const held = await api.rsu.quote.mutate({ force: false });
-    expect(held.price).toBe(10);
-    expect(held.manualPrice).toBe(true);
-    expect(fetchSpy).not.toHaveBeenCalled();
-
-    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.includes("USDINR")) return yahoo(83.25);
-      return yahoo(180.5);
-    });
-    const forced = await api.rsu.quote.mutate({ force: true });
-    expect(forced.price).toBe(180.5);
-    expect(forced.manualPrice).toBe(false);
-  });
-});
-
-describe("/api/events", () => {
-  it("streams an import event to open clients", async () => {
-    const api = client();
-    const res = await eventsGet();
-    expect(res.headers.get("content-type")).toContain("text/event-stream");
-    const reader = res.body?.getReader();
-    expect(reader).toBeTruthy();
-    if (!reader) return;
-    const decode = (chunk: Uint8Array | undefined) =>
-      new TextDecoder().decode(chunk);
-    try {
-      const first = await reader.read();
-      expect(decode(first.value)).toContain(": connected");
-      await api.rsu.importFile.mutate({
-        name: "ByStatus.xlsx",
-        dataBase64: workbook([
-          {
-            "Record Type": "Grant",
-            "Grant Number": "G-9",
-            "Grant Date": "08/15/2024",
-            Symbol: "EXPE",
-            "Granted Qty": 5,
-          },
-          {
-            "Record Type": "Vest",
-            "Grant Number": "G-9",
-            "Vest Date": "11/15/2099",
-            "Vested Qty": 5,
-          },
-        ]).toString("base64"),
-      });
-      const second = await reader.read();
-      const text = decode(second.value);
-      expect(text).toContain("event: import");
-      expect(text).toContain("ByStatus.xlsx");
-    } finally {
-      await reader.cancel();
-    }
   });
 });

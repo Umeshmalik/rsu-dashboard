@@ -1,6 +1,5 @@
 "use client";
 
-import { TRPCClientError } from "@trpc/client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bar,
@@ -12,20 +11,23 @@ import {
   YAxis,
 } from "recharts";
 
+import { LEDGER_KEY, loadLedger, saveLedger } from "~/lib/ledger";
+import { headerSummary, parseFile } from "~/server/parse";
 import {
   compute,
   fmtDate,
   genSchedule,
   INR,
+  mergeGrants,
   SAMPLE,
   toDate,
   today0,
   U,
   USD,
 } from "~/lib/rsu";
-import type { Grant, LastImport, PublicMeta, Settings } from "~/lib/types";
+import type { Grant, Settings } from "~/lib/types";
 import { Walkthrough } from "~/app/_components/walkthrough";
-import { api, type AppRouter } from "~/trpc/react";
+import { api } from "~/trpc/react";
 
 const C = {
   rule: "#D5DBD6",
@@ -44,10 +46,8 @@ type Status = { text: string; detail?: string | null };
 
 const focus =
   "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-gold";
-const btn =
-  `rounded-md border border-ink bg-ink px-3.5 py-2 text-sm font-semibold text-white disabled:cursor-default disabled:opacity-50 ${focus}`;
-const btnGhost =
-  `rounded-md border border-rule bg-transparent px-3.5 py-2 text-sm font-semibold text-ink disabled:cursor-default disabled:opacity-50 ${focus}`;
+const btn = `rounded-md border border-ink bg-ink px-3.5 py-2 text-sm font-semibold text-white disabled:cursor-default disabled:opacity-50 ${focus}`;
+const btnGhost = `rounded-md border border-rule bg-transparent px-3.5 py-2 text-sm font-semibold text-ink disabled:cursor-default disabled:opacity-50 ${focus}`;
 const btnSmall = "px-2.5 py-1";
 
 function ColorKey() {
@@ -63,7 +63,10 @@ function ColorKey() {
     <ul className="m-0 flex list-none flex-wrap gap-x-4 gap-y-1 p-0 text-[13px] text-mute">
       {items.map(([label, color]) => (
         <li key={label} className="flex items-center gap-1.5">
-          <span className="inline-block size-2.5 rounded-sm" style={{ background: color }} />
+          <span
+            className="inline-block size-2.5 rounded-sm"
+            style={{ background: color }}
+          />
           {label}
         </li>
       ))}
@@ -83,21 +86,27 @@ function SummaryRow({
   indent?: boolean;
 }) {
   return (
-    <div className={`flex items-baseline justify-between gap-4 border-b border-rule py-2.5 last:border-b-0 ${indent ? "pl-4" : ""}`}>
+    <div
+      className={`flex items-baseline justify-between gap-4 border-b border-rule py-2.5 last:border-b-0 ${indent ? "pl-4" : ""}`}
+    >
       <span className="text-mute">{label}</span>
       <span className="text-right">
         <span className="font-semibold text-ink">{value}</span>
-        {detail ? <span className="mt-0.5 block text-[13px] font-normal text-mute">{detail}</span> : null}
+        {detail ? (
+          <span className="mt-0.5 block text-[13px] font-normal text-mute">
+            {detail}
+          </span>
+        ) : null}
       </span>
     </div>
   );
 }
-const field =
-  `rounded-md border border-rule bg-white px-2 py-1.5 text-sm text-ink ${focus}`;
+const field = `rounded-md border border-rule bg-white px-2 py-1.5 text-sm text-ink ${focus}`;
 
-function ago(ms: number | null): string {
+function ago(ms: number | null, now: number | null): string {
   if (!ms) return "never";
-  const m = Math.round((Date.now() - ms) / 60000);
+  if (now == null) return fmtDate(new Date(ms));
+  const m = Math.round((now - ms) / 60000);
   if (m < 1) return "just now";
   if (m < 60) return `${m} min ago`;
   const h = Math.round(m / 60);
@@ -105,135 +114,47 @@ function ago(ms: number | null): string {
   return fmtDate(new Date(ms));
 }
 
-function readBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result;
-      if (typeof result !== "string") {
-        reject(new Error("Couldn't read that file"));
-        return;
-      }
-      const encoded = result.split(",")[1];
-      if (!encoded) {
-        reject(new Error("Couldn't read that file"));
-        return;
-      }
-      resolve(encoded);
-    };
-    reader.onerror = () =>
-      reject(reader.error ?? new Error("Couldn't read that file"));
-    reader.readAsDataURL(file);
-  });
-}
-
-function isTrpcError(e: unknown): e is TRPCClientError<AppRouter> {
-  return e instanceof TRPCClientError;
-}
-
 export function Dashboard() {
-  const [grants, setGrants] = useState<Grant[]>([]);
-  const [settings, setSettings] = useState<Settings | null>(null);
-  const [meta, setMeta] = useState<PublicMeta>({
-    lastImport: null,
-    watchDir: "",
-    watching: false,
-    dataFile: "",
-  });
-  const [loaded, setLoaded] = useState(false);
+  const stored = loadLedger();
+  const [grants, setGrants] = useState<Grant[]>(stored.grants);
+  const [settings, setSettings] = useState<Settings | null>(stored.settings);
+  const [lastImport, setLastImport] = useState(stored.lastImport);
+  const [loaded, setLoaded] = useState(true);
   const [online, setOnline] = useState(true);
   const [status, setStatus] = useState<Status | null>(null);
   const [tab, setTab] = useState<Tab>("upcoming");
   const [unit, setUnit] = useState<Unit>("units");
-  const [minute, setMinute] = useState(0);
+  const [now, setNow] = useState<number | null>(null);
+  const [chartReady, setChartReady] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement>>>({});
   const backupRef = useRef<HTMLInputElement>(null);
   const skipSave = useRef(true);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const utils = api.useUtils();
-  const utilsRef = useRef(utils);
-  utilsRef.current = utils;
-
-  const stateQuery = api.rsu.state.useQuery(undefined, {
+  const grantsRef = useRef(grants);
+  grantsRef.current = grants;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const [needsClaim] = useState(() => {
+    try {
+      return localStorage.getItem(LEDGER_KEY) == null;
+    } catch {
+      return false;
+    }
+  });
+  const claim = api.rsu.claim.useQuery(undefined, {
+    enabled: needsClaim,
+    retry: false,
     refetchOnWindowFocus: false,
   });
-  const save = api.rsu.save.useMutation({
-    onError: () =>
-      setStatus({ text: "Couldn't save. Is the server still running?" }),
-  });
-  const importFile = api.rsu.importFile.useMutation();
-  const saveRef = useRef(save.mutate);
-  saveRef.current = save.mutate;
+  const discard = api.rsu.discard.useMutation();
+  const discardRef = useRef(discard.mutate);
+  discardRef.current = discard.mutate;
+  const claimed = useRef(false);
   const quote = api.rsu.quote.useMutation({
     onSuccess: (s) => {
-      setSettings((cur) =>
-        cur
-          ? {
-              ...cur,
-              price: s.price,
-              usdinr: s.usdinr,
-              asOf: s.asOf,
-              fetchedAt: s.fetchedAt,
-              manualPrice: s.manualPrice,
-            }
-          : cur,
-      );
-    },
-    onError: (e) =>
-      setStatus({
-        text: `${e.message}. Enter the price under Assumptions, or try again.`,
-      }),
-  });
-
-  const reload = useCallback(async () => {
-    try {
-      const s = await utils.rsu.state.fetch();
-      if (saveTimer.current) clearTimeout(saveTimer.current);
-      skipSave.current = true;
-      setGrants(s.grants);
-      setSettings(s.settings);
-      setMeta(s.meta);
       setOnline(true);
-    } catch {
-      setOnline(false);
-    }
-    setLoaded(true);
-  }, [utils]);
-
-  useEffect(() => {
-    if (!stateQuery.data) return;
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    skipSave.current = true;
-    setGrants(stateQuery.data.grants);
-    setSettings(stateQuery.data.settings);
-    setMeta(stateQuery.data.meta);
-    setOnline(true);
-    setLoaded(true);
-  }, [stateQuery.data]);
-
-  useEffect(() => {
-    if (stateQuery.isError) {
-      setOnline(false);
-      setLoaded(true);
-    }
-  }, [stateQuery.isError]);
-
-  useEffect(() => {
-    const es = new EventSource("/api/events");
-    es.onopen = () => setOnline(true);
-    es.onerror = () => setOnline(false);
-    es.addEventListener("import", (event) => {
-      const info = JSON.parse(
-        (event as MessageEvent<string>).data,
-      ) as LastImport;
-      setStatus({
-        text: `Imported ${info.file}: ${info.grants} grant${info.grants === 1 ? "" : "s"}, ${info.vests} vest dates.`,
-      });
-      void utilsRef.current.rsu.state.invalidate();
-    });
-    es.addEventListener("quote", (event) => {
-      const s = JSON.parse((event as MessageEvent<string>).data) as Settings;
       setSettings((cur) =>
         cur
           ? {
@@ -246,13 +167,76 @@ export function Dashboard() {
             }
           : cur,
       );
-    });
-    const t = setInterval(() => setMinute((n) => n + 1), 60_000);
-    return () => {
-      es.close();
-      clearInterval(t);
-    };
+    },
+    onError: (e) => {
+      const offline = typeof navigator !== "undefined" && navigator.onLine === false;
+      setOnline(!offline);
+      setStatus({
+        text: offline
+          ? "You're offline. The last price and USD/INR stay in use."
+          : `${e.message}. Enter the price under Assumptions, or try again.`,
+      });
+    },
+  });
+  const quoteRef = useRef(quote.mutate);
+  quoteRef.current = quote.mutate;
+
+  const pullQuote = useCallback((fresh: boolean) => {
+    const current = settingsRef.current;
+    if (!current || grantsRef.current.length === 0) return;
+    if (!fresh && current.manualPrice) return;
+    if (
+      !fresh &&
+      current.price &&
+      current.fetchedAt &&
+      Date.now() - current.fetchedAt < 10 * 60 * 1000
+    ) {
+      return;
+    }
+    if (!fresh && typeof navigator !== "undefined" && navigator.onLine === false) return;
+    quoteRef.current({ symbol: current.symbol, fresh });
   }, []);
+
+  useEffect(() => {
+    if (!claim.data || claimed.current) return;
+    claimed.current = true;
+    const next = {
+      grants: claim.data.grants,
+      settings: claim.data.settings,
+      lastImport: claim.data.lastImport,
+    };
+    saveLedger(next);
+    skipSave.current = true;
+    setGrants(next.grants);
+    setSettings(next.settings);
+    setLastImport(next.lastImport);
+    discardRef.current();
+  }, [claim.data]);
+
+  useEffect(() => {
+    const onOnline = () => {
+      setOnline(true);
+      pullQuote(false);
+    };
+    const onOffline = () => setOnline(false);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    setOnline(navigator.onLine);
+    const tick = () => setNow(Date.now());
+    tick();
+    setChartReady(true);
+    const clock = setInterval(tick, 60_000);
+    const prices = setInterval(() => pullQuote(false), 15 * 60 * 1000);
+    if (process.env.NODE_ENV === "production" && "serviceWorker" in navigator) {
+      void navigator.serviceWorker.register("/sw.js");
+    }
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+      clearInterval(clock);
+      clearInterval(prices);
+    };
+  }, [pullQuote]);
 
   const closeGuide = useCallback(() => {
     try {
@@ -266,7 +250,8 @@ export function Dashboard() {
   useEffect(() => {
     if (!loaded) return;
     try {
-      if (localStorage.getItem("rsu-ledger-walkthrough") !== "1") setGuideOpen(true);
+      if (localStorage.getItem("rsu-ledger-walkthrough") !== "1")
+        setGuideOpen(true);
     } catch {
       setGuideOpen(true);
     }
@@ -280,31 +265,40 @@ export function Dashboard() {
     }
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      saveRef.current({ grants, settings });
+      saveLedger({ grants, settings, lastImport });
     }, 400);
-  }, [grants, settings, loaded]);
+  }, [grants, settings, lastImport, loaded]);
 
   useEffect(() => {
-    if (loaded && grants.length > 0) quote.mutate({ force: false });
-    // Refresh once grants are on screen. Later edits should not refetch.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded, grants.length > 0]);
+    pullQuote(false);
+  }, [grants.length, pullQuote]);
 
   const onImport = async (file: File | undefined) => {
     if (!file) return;
     try {
-      const dataBase64 = await readBase64(file);
-      await importFile.mutateAsync({ name: file.name, dataBase64 });
-      await reload();
-    } catch (e) {
-      const message = isTrpcError(e) ? e.message : "Import failed";
-      const headers = isTrpcError(e)
-        ? (e.data as { headers?: unknown } | null)?.headers
-        : null;
+      const data = await file.arrayBuffer();
+      const parsed = parseFile(data);
+      if (parsed.length === 0) {
+        setStatus({
+          text: "No RSU grants found in that file. Use Holdings → download → Download expanded in E*TRADE.",
+          detail: JSON.stringify(headerSummary(data), null, 2),
+        });
+        return;
+      }
+      const sym = parsed.find((grant) => grant.symbol)?.symbol;
+      setGrants((current) => mergeGrants(current, parsed));
+      setSettings((current) =>
+        current && sym && sym !== current.symbol
+          ? { ...current, symbol: sym, fetchedAt: null }
+          : current,
+      );
+      setLastImport({ at: Date.now(), file: file.name });
       setStatus({
-        text: message,
-        detail: headers ? JSON.stringify(headers, null, 2) : null,
+        text: `Imported ${file.name}: ${parsed.length} grant${parsed.length === 1 ? "" : "s"}, ${parsed.reduce((sum, grant) => sum + grant.vests.length, 0)} vest dates.`,
       });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Import failed";
+      setStatus({ text: `Couldn't read ${file.name}: ${message}` });
     } finally {
       if (fileRef.current) fileRef.current.value = "";
     }
@@ -322,7 +316,8 @@ export function Dashboard() {
                   ? v
                   : {
                       ...v,
-                      withheld: val === "" ? null : Math.max(0, Number(val) || 0),
+                      withheld:
+                        val === "" ? null : Math.max(0, Number(val) || 0),
                       src: val === "" ? "manual" : "edited",
                     },
               ),
@@ -368,8 +363,6 @@ export function Dashboard() {
   const guide = (
     <Walkthrough
       open={guideOpen}
-      watchDir={meta.watchDir || "~/Downloads"}
-      watching={meta.watching}
       onClose={closeGuide}
       onImport={() => fileRef.current?.click()}
     />
@@ -399,20 +392,14 @@ export function Dashboard() {
       <span
         className={`mr-1.5 inline-block size-2 rounded-full align-[1px] ${online ? "bg-got" : "bg-rule"}`}
       />
-      {online ? "Running locally" : "Server offline"}.{" "}
-      {meta.watching ? (
+      {online
+        ? "Grants stay in this browser. Price and USD/INR update while you are online."
+        : "You're offline. Grants in this browser still work. The last price and USD/INR stay in use."}{" "}
+      {lastImport && (
         <>
-          Auto-importing E*TRADE exports saved to <code className="rounded bg-[#eef1ee] px-1">{meta.watchDir}</code>.{" "}
-        </>
-      ) : (
-        "Folder auto-import is off. "
-      )}
-      {meta.lastImport && (
-        <>
-          Last import {ago(meta.lastImport.at)} from {meta.lastImport.file}.
+          Last import {ago(lastImport.at, now)} from {lastImport.file}.
         </>
       )}
-      <span className="sr-only">{minute}</span>
     </div>
   );
 
@@ -439,17 +426,13 @@ export function Dashboard() {
     </div>
   );
 
-  if (!loaded) {
-    return (
-      <main className="mx-auto max-w-[1080px] px-5 pt-7 pb-16">Loading…</main>
-    );
-  }
-
   if (!settings || !computed) {
     return (
-      <main className="mx-auto max-w-[1080px] px-5 pt-7 pb-16">
+      <main className="mx-auto max-w-270 px-5 pt-7 pb-16">
         <div className="rounded-md border border-rule border-l-4 border-l-gold bg-white px-3.5 py-2.5 text-sm">
-          Can't reach the local server. Start it with <code className="rounded bg-[#eef1ee] px-1">pnpm dev</code>, then reload this page.
+          Can't reach the local server. Start it with{" "}
+          <code className="rounded bg-[#eef1ee] px-1">pnpm dev</code>, then
+          reload this page.
         </div>
       </main>
     );
@@ -460,7 +443,11 @@ export function Dashboard() {
   const usd = (units: number) => (price ? units * price : null);
   const inr = (units: number) => (price && fx ? units * price * fx : null);
   const conv = (units: number) =>
-    unit === "units" ? units : unit === "usd" ? (usd(units) ?? 0) : (inr(units) ?? 0);
+    unit === "units"
+      ? units
+      : unit === "usd"
+        ? (usd(units) ?? 0)
+        : (inr(units) ?? 0);
   const fmtConv = (v: number): string => {
     switch (unit) {
       case "units":
@@ -478,35 +465,34 @@ export function Dashboard() {
 
   if (!grants.length) {
     return (
-      <main className="mx-auto max-w-[1080px] px-5 pt-7 pb-16">
-        <div className="mb-2.5 text-lg font-extrabold tracking-tight">RSU ledger</div>
+      <main className="mx-auto max-w-270 px-5 pt-7 pb-16">
+        <div className="mb-2.5 text-lg font-extrabold tracking-tight">
+          RSU ledger
+        </div>
         {syncLine}
         {statusBox}
-        <div className="max-w-[680px] rounded-[10px] border border-rule bg-card p-8">
+        <div className="max-w-170 rounded-[10px] border border-rule bg-card p-8">
           <h1 className="m-0 mb-2 text-3xl font-extrabold tracking-tight">
             Load your grants from E*TRADE
           </h1>
           <p className="m-0 leading-normal text-mute">
-            Everything stays on this computer. The only outbound request is a price lookup for your ticker.
+            The sheet is read in this browser and is not uploaded. The only
+            request this site makes is the share price and the USD/INR rate.
           </p>
           <ol className="my-3 mb-5 list-decimal pl-5 leading-7">
             <li>Open Stock Plan → My Account → Holdings in E*TRADE.</li>
             <li>
               Click the download icon and choose <b>Download expanded</b>.
             </li>
-            <li>
-              {meta.watching ? (
-                <>
-                  That's it. Files saved to <code className="rounded bg-[#eef1ee] px-1">{meta.watchDir}</code> are imported automatically. Or import one here.
-                </>
-              ) : (
-                "Import the file here."
-              )}
-            </li>
+            <li>Import the file here. It stays in this browser, including while you are offline.</li>
           </ol>
           <div className="flex flex-wrap items-center gap-2.5">
             {upload("Import from E*TRADE")}
-            <button type="button" className={btnGhost} onClick={() => setGuideOpen(true)}>
+            <button
+              type="button"
+              className={btnGhost}
+              onClick={() => setGuideOpen(true)}
+            >
               Show the steps
             </button>
             <button
@@ -524,7 +510,8 @@ export function Dashboard() {
     );
   }
 
-  const { T, rows, next, rate, taxRate, histRate, fy, quarters, scheduled } = computed;
+  const { T, rows, next, rate, taxRate, histRate, fy, quarters, scheduled } =
+    computed;
   const inrOf = (dollars: number | null) =>
     dollars != null && fx ? dollars * fx : null;
   const pct = (units: number) => (scheduled ? (units / scheduled) * 100 : 0);
@@ -538,11 +525,13 @@ export function Dashboard() {
   const vestRows = rows
     .filter((r) => (tab === "past" ? r.past : !r.past))
     .sort((a, b) =>
-      tab === "past" ? b.d.getTime() - a.d.getTime() : a.d.getTime() - b.d.getTime(),
+      tab === "past"
+        ? b.d.getTime() - a.d.getTime()
+        : a.d.getTime() - b.d.getTime(),
     );
 
   return (
-    <main className="mx-auto max-w-[1080px] px-5 pt-7 pb-16">
+    <main className="mx-auto max-w-270 px-5 pt-7 pb-16">
       <div className="mb-2.5 flex flex-wrap items-center justify-between gap-3">
         <div className="text-lg font-extrabold tracking-tight">RSU ledger</div>
         <div className="flex flex-wrap items-center gap-3 text-sm text-mute">
@@ -560,21 +549,35 @@ export function Dashboard() {
               |
             </span>
             <span>
-              USD/INR <b className="font-semibold text-ink">{fx ? fx.toFixed(2) : "—"}</b>
+              USD/INR{" "}
+              <b className="font-semibold text-ink">
+                {fx ? fx.toFixed(2) : "—"}
+              </b>
+            </span>
+            <span className="sr-only">
+              {settings.asOf ?? "Live USD/INR spot, the rate E*TRADE uses"}
             </span>
           </span>
           <span>
-            {settings.manualPrice ? "entered manually" : `updated ${ago(settings.fetchedAt)}`}
+            {settings.manualPrice
+              ? "entered manually"
+              : `updated ${ago(settings.fetchedAt, now)}`}
           </span>
           <button
             type="button"
             className={btnGhost}
-            onClick={() => quote.mutate({ force: true })}
+            onClick={() => {
+              if (settings) quote.mutate({ symbol: settings.symbol, fresh: true });
+            }}
             disabled={quote.isPending}
           >
             {quote.isPending ? "Fetching…" : "Refresh price"}
           </button>
-          <button type="button" className={btnGhost} onClick={() => setGuideOpen(true)}>
+          <button
+            type="button"
+            className={btnGhost}
+            onClick={() => setGuideOpen(true)}
+          >
             Guide
           </button>
           {upload("Import file", true)}
@@ -593,7 +596,9 @@ export function Dashboard() {
 
         <div className="mt-6 grid gap-4 md:grid-cols-2">
           <section className="rounded-lg border border-rule bg-card px-5 py-4">
-            <h2 className="m-0 text-sm font-semibold tracking-wide text-mute uppercase">Already vested</h2>
+            <h2 className="m-0 text-sm font-semibold tracking-wide text-mute uppercase">
+              Already vested
+            </h2>
             <p className="m-0 mt-1 text-[40px] leading-none font-extrabold tracking-tight">
               {U(T.vested)}{" "}
               <span className="text-base font-medium text-mute">shares</span>
@@ -604,32 +609,56 @@ export function Dashboard() {
                 value={`${tilde(T.pastEst)}${U(T.pastNet)}`}
                 detail={money(usd(T.pastNet))}
               />
-              <SummaryRow label="Sold for tax" value={`${tilde(T.pastEst)}${U(T.pastSold)}`} />
+              <SummaryRow
+                label="Sold for tax"
+                value={`${tilde(T.pastEst)}${U(T.pastSold)}`}
+              />
               <SummaryRow
                 indent
                 label="Tax"
                 value={`${tilde(T.pastEst)}${U(T.pastTax)}`}
                 detail={money(T.pastTaxUsd)}
               />
-              <SummaryRow indent label="Paid in salary" value={`${tilde(T.pastEst)}${money(T.pastSalaryUsd)}`} />
+              <SummaryRow
+                indent
+                label="Paid in salary"
+                value={`${tilde(T.pastEst)}${money(T.pastSalaryUsd)}`}
+              />
             </div>
           </section>
 
           <section className="rounded-lg border border-rule bg-card px-5 py-4">
-            <h2 className="m-0 text-sm font-semibold tracking-wide text-mute uppercase">Still to vest</h2>
+            <h2 className="m-0 text-sm font-semibold tracking-wide text-mute uppercase">
+              Still to vest
+            </h2>
             <p className="m-0 mt-1 text-[40px] leading-none font-extrabold tracking-tight">
               {U(T.unvested)}{" "}
               <span className="text-base font-medium text-mute">shares</span>
             </p>
             <div className="mt-3">
-              <SummaryRow label="You keep" value={`~${U(T.futNet)}`} detail={money(usd(T.futNet))} />
+              <SummaryRow
+                label="You keep"
+                value={`~${U(T.futNet)}`}
+                detail={money(usd(T.futNet))}
+              />
               <SummaryRow label="Sold for tax" value={`~${U(T.futSold)}`} />
-              <SummaryRow indent label="Tax" value={`~${U(T.futTax)}`} detail={money(usd(T.futTax))} />
-              <SummaryRow indent label="Paid in salary" value={`~${money(usd(T.futSalary))}`} />
+              <SummaryRow
+                indent
+                label="Tax"
+                value={`~${U(T.futTax)}`}
+                detail={money(usd(T.futTax))}
+              />
+              <SummaryRow
+                indent
+                label="Paid in salary"
+                value={`~${money(usd(T.futSalary))}`}
+              />
             </div>
             {next && (
               <p className="m-0 mt-3 text-sm leading-normal text-mute">
-                <span className="font-semibold text-ink">Next {fmtDate(next.date)}</span>
+                <span className="font-semibold text-ink">
+                  Next {fmtDate(next.date)}
+                </span>
                 {" · "}
                 {next.days} day{next.days === 1 ? "" : "s"}
                 {" · "}
@@ -639,38 +668,74 @@ export function Dashboard() {
           </section>
         </div>
 
-        <div className="relative mt-10 flex h-8 rounded bg-rule" aria-label="Share breakdown">
-          <div className="h-full rounded-l" style={{ width: `${pct(T.pastTax)}%`, background: C.tax }} />
-          <div className="h-full" style={{ width: `${pct(T.pastSalary)}%`, background: C.pay }} />
-          <div className="h-full" style={{ width: `${pct(T.pastNet)}%`, background: C.got }} />
-          <div className="h-full" style={{ width: `${pct(T.futNet)}%`, background: C.fGot }} />
-          <div className="h-full" style={{ width: `${pct(T.futSalary)}%`, background: C.fPay }} />
-          <div className="h-full rounded-r" style={{ width: `${pct(T.futTax)}%`, background: C.fTax }} />
-          <div className="absolute -top-2.5 -bottom-2.5 w-0.5 bg-gold" style={{ left: `calc(${pct(T.vested)}% - 1px)` }}>
-            <span className="absolute -top-5 left-1/2 -translate-x-1/2 text-xs font-bold whitespace-nowrap text-gold">Today</span>
+        <div
+          className="relative mt-10 flex h-8 rounded bg-rule"
+          role="img"
+          aria-label="Share breakdown"
+        >
+          <div
+            className="h-full rounded-l"
+            style={{ width: `${pct(T.pastTax)}%`, background: C.tax }}
+          />
+          <div
+            className="h-full"
+            style={{ width: `${pct(T.pastSalary)}%`, background: C.pay }}
+          />
+          <div
+            className="h-full"
+            style={{ width: `${pct(T.pastNet)}%`, background: C.got }}
+          />
+          <div
+            className="h-full"
+            style={{ width: `${pct(T.futNet)}%`, background: C.fGot }}
+          />
+          <div
+            className="h-full"
+            style={{ width: `${pct(T.futSalary)}%`, background: C.fPay }}
+          />
+          <div
+            className="h-full rounded-r"
+            style={{ width: `${pct(T.futTax)}%`, background: C.fTax }}
+          />
+          <div
+            className="absolute -top-2.5 -bottom-2.5 w-0.5 bg-gold"
+            style={{ left: `calc(${pct(T.vested)}% - 1px)` }}
+          >
+            <span className="absolute -top-5 left-1/2 -translate-x-1/2 text-xs font-bold whitespace-nowrap text-gold">
+              Today
+            </span>
           </div>
         </div>
         <div className="mt-3">
           <ColorKey />
         </div>
         <p className="mt-3 max-w-[70ch] text-[13px] leading-normal text-mute">
-          {U(T.pastNet)} in your account + {U(T.pastSold)} sold + {U(T.unvested)} still to vest = {U(T.granted)} granted.
-          Tax is {(taxRate * 100).toFixed(1)}%. A partial share is still sold whole, and the leftover cash is paid in salary.
+          {U(T.pastNet)} in your account + {U(T.pastSold)} sold +{" "}
+          {U(T.unvested)} still to vest = {U(T.granted)} granted. Tax is{" "}
+          {(taxRate * 100).toFixed(1)}%. A partial share is still sold whole,
+          and the leftover cash is paid in salary.
           {settings.useHistRate && histRate != null
             ? ` Future sales use the ${(rate * 100).toFixed(1)}% sold so far.`
             : ""}
         </p>
         {mismatch.length > 0 && (
           <p className="text-[13px] text-tax">
-            Grant {mismatch.map((g) => g.grantNumber).join(", ")}: the vest schedule doesn't add up to the granted total. Check the Grants tab.
+            Grant {mismatch.map((g) => g.grantNumber).join(", ")}: the vest
+            schedule doesn't add up to the granted total. Check the Grants tab.
           </p>
         )}
       </section>
 
       <section className="mt-11">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2.5">
-          <h2 className="m-0 text-xl font-bold tracking-tight">Vests by quarter</h2>
-          <div className="inline-flex overflow-hidden rounded-md border border-rule" role="group" aria-label="Show chart in">
+          <h2 className="m-0 text-xl font-bold tracking-tight">
+            Vests by quarter
+          </h2>
+          <div
+            className="inline-flex overflow-hidden rounded-md border border-rule"
+            role="group"
+            aria-label="Show chart in"
+          >
             {(
               [
                 ["units", "Units"],
@@ -681,6 +746,7 @@ export function Dashboard() {
               <button
                 key={k}
                 type="button"
+                aria-pressed={unit === k}
                 className={`px-3 py-1.5 text-[13px] ${unit === k ? "bg-ink text-white" : "bg-card text-mute"} ${focus}`}
                 onClick={() => setUnit(k)}
               >
@@ -690,54 +756,63 @@ export function Dashboard() {
           </div>
         </div>
         <div className="rounded-lg border border-rule bg-card px-2 pt-4 pb-1">
-          <ResponsiveContainer width="100%" height={280}>
-            <BarChart
-              data={quarters.map((q) => ({
-                k: q.k,
-                pastNet: conv(q.pastNet),
-                pastTax: conv(q.pastTax),
-                pastSalary: conv(q.pastSalary),
-                futNet: conv(q.futNet),
-                futTax: conv(q.futTax),
-                futSalary: conv(q.futSalary),
-              }))}
-            >
-              <CartesianGrid vertical={false} stroke={C.rule} />
-              <XAxis dataKey="k" tick={{ fontSize: 11, fill: C.mute }} interval="preserveStartEnd" />
-              <YAxis
-                tick={{ fontSize: 11, fill: C.mute }}
-                width={70}
-                tickFormatter={(v: number) =>
-                  unit === "units"
-                    ? U(v)
-                    : unit === "usd"
-                      ? `$${Math.round(v / 1000)}k`
-                      : `₹${(v / 1e5).toFixed(1)}L`
-                }
-              />
-              <Tooltip
-                formatter={(value, name) => {
-                  const numeric = typeof value === "number" ? value : Number(value ?? 0);
-                  const key = String(name ?? "");
-                  const labels: Record<string, string> = {
-                    pastNet: "Received",
-                    pastTax: "Tax",
-                    pastSalary: "In salary",
-                    futNet: "To receive",
-                    futTax: "Future tax",
-                    futSalary: "Future salary",
-                  };
-                  return [fmtConv(numeric), labels[key] ?? key];
-                }}
-              />
-              <Bar dataKey="pastTax" stackId="a" fill={C.tax} />
-              <Bar dataKey="pastSalary" stackId="a" fill={C.pay} />
-              <Bar dataKey="pastNet" stackId="a" fill={C.got} />
-              <Bar dataKey="futNet" stackId="a" fill={C.fGot} />
-              <Bar dataKey="futSalary" stackId="a" fill={C.fPay} />
-              <Bar dataKey="futTax" stackId="a" fill={C.fTax} />
-            </BarChart>
-          </ResponsiveContainer>
+          {chartReady ? (
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart
+                data={quarters.map((q) => ({
+                  k: q.k,
+                  pastNet: conv(q.pastNet),
+                  pastTax: conv(q.pastTax),
+                  pastSalary: conv(q.pastSalary),
+                  futNet: conv(q.futNet),
+                  futTax: conv(q.futTax),
+                  futSalary: conv(q.futSalary),
+                }))}
+              >
+                <CartesianGrid vertical={false} stroke={C.rule} />
+                <XAxis
+                  dataKey="k"
+                  tick={{ fontSize: 11, fill: C.mute }}
+                  interval="preserveStartEnd"
+                />
+                <YAxis
+                  tick={{ fontSize: 11, fill: C.mute }}
+                  width={70}
+                  tickFormatter={(v: number) =>
+                    unit === "units"
+                      ? U(v)
+                      : unit === "usd"
+                        ? `$${Math.round(v / 1000)}k`
+                        : `₹${(v / 1e5).toFixed(1)}L`
+                  }
+                />
+                <Tooltip
+                  formatter={(value, name) => {
+                    const numeric =
+                      typeof value === "number" ? value : Number(value ?? 0);
+                    const key = String(name ?? "");
+                    const labels: Record<string, string> = {
+                      pastNet: "Received",
+                      pastTax: "Tax",
+                      pastSalary: "In salary",
+                      futNet: "To receive",
+                      futTax: "Future tax",
+                      futSalary: "Future salary",
+                    };
+                    return [fmtConv(numeric), labels[key] ?? key];
+                  }}
+                />
+                <Bar dataKey="pastTax" stackId="a" fill={C.tax} />
+                <Bar dataKey="pastSalary" stackId="a" fill={C.pay} />
+                <Bar dataKey="pastNet" stackId="a" fill={C.got} />
+                <Bar dataKey="futNet" stackId="a" fill={C.fGot} />
+                <Bar dataKey="futSalary" stackId="a" fill={C.fPay} />
+                <Bar dataKey="futTax" stackId="a" fill={C.fTax} />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-70" />
+          )}
           <div className="px-3 pb-3">
             <ColorKey />
           </div>
@@ -745,7 +820,35 @@ export function Dashboard() {
       </section>
 
       <section className="mt-11">
-        <div className="mb-3.5 flex flex-wrap gap-1 border-b border-rule" role="tablist">
+        <div
+          className="mb-3.5 flex flex-wrap gap-1 border-b border-rule"
+          role="tablist"
+          onKeyDown={(event) => {
+            const keys: Tab[] = ["upcoming", "past", "fy", "grants"];
+            const index = keys.indexOf(tab);
+            let next: Tab | undefined;
+            switch (event.key) {
+              case "ArrowRight":
+                next = keys[(index + 1) % keys.length];
+                break;
+              case "ArrowLeft":
+                next = keys[(index - 1 + keys.length) % keys.length];
+                break;
+              case "Home":
+                next = keys[0];
+                break;
+              case "End":
+                next = keys[keys.length - 1];
+                break;
+              default:
+                return;
+            }
+            if (!next) return;
+            event.preventDefault();
+            setTab(next);
+            tabRefs.current[next]?.focus();
+          }}
+        >
           {(
             [
               ["upcoming", "Upcoming vests"],
@@ -756,9 +859,16 @@ export function Dashboard() {
           ).map(([k, label]) => (
             <button
               key={k}
+              ref={(node) => {
+                if (node) tabRefs.current[k] = node;
+                else delete tabRefs.current[k];
+              }}
+              id={`tab-${k}`}
               type="button"
               role="tab"
               aria-selected={tab === k}
+              aria-controls="ledger-panel"
+              tabIndex={tab === k ? 0 : -1}
               className={`border-b-[3px] px-3 py-2.5 text-sm font-semibold ${tab === k ? "border-ink text-ink" : "border-transparent text-mute"} ${focus}`}
               onClick={() => setTab(k)}
             >
@@ -767,168 +877,270 @@ export function Dashboard() {
           ))}
         </div>
 
-        {tab === "upcoming" || tab === "past" ? (
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse overflow-hidden rounded-lg border border-rule bg-card text-sm">
-              <thead>
-                <tr>
-                  {["Vest date", "Grant", "Vesting", "Shares sold", "Tax", "In salary", "You keep"].map((h) => (
-                    <th key={h} className="border-b border-rule bg-[#fafbfa] px-3.5 py-2.5 text-right text-[13px] font-semibold text-mute first:text-left">
-                      {h}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {vestRows.map((r) => (
-                  <tr key={r.grantId + r.date}>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-left">{fmtDate(r.date)}</td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-left">{r.grant}</td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-right">{U(r.qty)}</td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-right">
-                      {tab === "past" ? (
-                        <input
-                          className={`${field} w-20 text-right`}
-                          type="number"
-                          min="0"
-                          aria-label={`Shares sold for tax on ${r.date}`}
-                          value={r.est ? "" : r.withheld}
-                          placeholder={`~${r.withheld}`}
-                          onChange={(e) => setWithheld(r.grantId, r.idx, e.target.value)}
-                        />
-                      ) : (
-                        <span className="text-mute">~{U(r.withheld)}</span>
-                      )}
-                    </td>
-                    <td className={`border-b border-rule px-3.5 py-2.5 text-right ${r.est ? "text-mute" : ""}`}>
-                      {r.est ? "~" : ""}
-                      {U(r.taxShares)}
-                    </td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-right">
-                      {r.est ? "~" : ""}
-                      {USD((r.fmv ?? price) == null ? null : r.salaryShares * (r.fmv ?? price ?? 0))}
-                    </td>
-                    <td className={`border-b border-rule px-3.5 py-2.5 text-right ${r.est ? "text-mute" : ""}`}>
-                      {r.est ? "~" : ""}
-                      {U(r.net)}
-                      <div className="text-[12px] leading-tight whitespace-nowrap text-mute">
-                        {USD(usd(r.net))} · {INR(inr(r.net))}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {tab === "past" && (
-              <p className="mt-2 max-w-[80ch] text-[13px] leading-normal text-mute">
-                Shares sold is the whole number from each E*TRADE release. Tax is your rate times the vest. Anything left from the last share is cash in that month's salary. Blank rows are estimates, shown with ~.
-              </p>
-            )}
-          </div>
-        ) : tab === "fy" ? (
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse overflow-hidden rounded-lg border border-rule bg-card text-sm">
-              <thead>
-                <tr>
-                  {["Financial year", "Vests", "Vesting", "Sold", "Tax", "In salary", "You keep", "Status"].map((h) => (
-                    <th key={h} className="border-b border-rule bg-[#fafbfa] px-3.5 py-2.5 text-right text-[13px] font-semibold text-mute first:text-left">
-                      {h}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {fy.map((f) => (
-                  <tr key={f.fy}>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-left">{f.fy}</td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-right">{f.count}</td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-right">{U(f.qty)}</td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-right">{U(f.sold)}</td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-right">{U(f.tax)}</td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-right">{U(f.salary)}</td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-right">{U(f.net)}</td>
-                    <td className="border-b border-rule px-3.5 py-2.5 text-right">
-                      {f.fut === 0 ? "Done" : f.past === 0 ? "Upcoming" : "In progress"}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <p className="mt-2 max-w-[80ch] text-[13px] leading-normal text-mute">
-              April to March, matching Indian income tax years. Useful for Schedule FA and ITR prep; use vest-date values from Form 16 when filing.
-            </p>
-          </div>
-        ) : (
-          <>
+        <div id="ledger-panel" role="tabpanel" aria-labelledby={`tab-${tab}`}>
+          {tab === "upcoming" || tab === "past" ? (
             <div className="overflow-x-auto">
               <table className="w-full border-collapse overflow-hidden rounded-lg border border-rule bg-card text-sm">
                 <thead>
                   <tr>
-                    {["Grant", "Granted on", "Granted", "Scheduled", "Vested", "Unvested", "Progress", ""].map((h) => (
-                      <th key={h || "actions"} className="border-b border-rule bg-[#fafbfa] px-3.5 py-2.5 text-right text-[13px] font-semibold text-mute first:text-left">
+                    {[
+                      "Vest date",
+                      "Grant",
+                      "Vesting",
+                      "Shares sold",
+                      "Tax",
+                      "In salary",
+                      "You keep",
+                    ].map((h) => (
+                      <th
+                        key={h}
+                        scope="col"
+                        className="border-b border-rule bg-[#fafbfa] px-3.5 py-2.5 text-right text-[13px] font-semibold text-mute first:text-left"
+                      >
                         {h}
                       </th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {grants.map((g) => {
-                    const t = today0();
-                    const sch = g.vests.reduce((a, v) => a + v.qty, 0);
-                    const vd = g.vests
-                      .filter((v) => {
-                        const d = toDate(v.date);
-                        return d != null && d <= t;
-                      })
-                      .reduce((a, v) => a + v.qty, 0);
-                    return (
-                      <tr key={g.id}>
-                        <td className="border-b border-rule px-3.5 py-2.5 text-left">{g.grantNumber}</td>
-                        <td className="border-b border-rule px-3.5 py-2.5 text-right">{fmtDate(g.grantDate)}</td>
-                        <td className="border-b border-rule px-3.5 py-2.5 text-right">{U(g.granted)}</td>
-                        <td className={`border-b border-rule px-3.5 py-2.5 text-right ${Math.abs(sch - g.granted) > 0.5 ? "text-tax" : ""}`}>
-                          {U(sch)}
-                        </td>
-                        <td className="border-b border-rule px-3.5 py-2.5 text-right">{U(vd)}</td>
-                        <td className="border-b border-rule px-3.5 py-2.5 text-right">{U(sch - vd)}</td>
-                        <td className="min-w-[120px] border-b border-rule px-3.5 py-2.5">
-                          <div className="h-2 rounded bg-rule">
-                            <div
-                              className="h-full rounded bg-got"
-                              style={{ width: `${sch ? (vd / sch) * 100 : 0}%` }}
-                            />
-                          </div>
-                        </td>
-                        <td className="border-b border-rule px-3.5 py-2.5 text-right">
-                          <button
-                            type="button"
-                            className={`${btnGhost} ${btnSmall}`}
-                            onClick={() => {
-                              if (confirm(`Remove grant ${g.grantNumber}?`)) {
-                                setGrants((gs) => gs.filter((x) => x.id !== g.id));
-                              }
-                            }}
-                          >
-                            Remove
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  {vestRows.map((r) => (
+                    <tr key={r.grantId + r.date}>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-left">
+                        {fmtDate(r.date)}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-left">
+                        {r.grant}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                        {U(r.qty)}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                        {tab === "past" ? (
+                          <input
+                            className={`${field} w-20 text-right`}
+                            type="number"
+                            min="0"
+                            aria-label={`Shares sold for tax on ${r.date}`}
+                            value={r.est ? "" : r.withheld}
+                            placeholder={`~${r.withheld}`}
+                            onChange={(e) =>
+                              setWithheld(r.grantId, r.idx, e.target.value)
+                            }
+                          />
+                        ) : (
+                          <span className="text-mute">~{U(r.withheld)}</span>
+                        )}
+                      </td>
+                      <td
+                        className={`border-b border-rule px-3.5 py-2.5 text-right ${r.est ? "text-mute" : ""}`}
+                      >
+                        {r.est ? "~" : ""}
+                        {U(r.taxShares)}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                        {r.est ? "~" : ""}
+                        {USD(
+                          (r.fmv ?? price) == null
+                            ? null
+                            : r.salaryShares * (r.fmv ?? price ?? 0),
+                        )}
+                      </td>
+                      <td
+                        className={`border-b border-rule px-3.5 py-2.5 text-right ${r.est ? "text-mute" : ""}`}
+                      >
+                        {r.est ? "~" : ""}
+                        {U(r.net)}
+                        <div className="text-[12px] leading-tight whitespace-nowrap text-mute">
+                          {USD(usd(r.net))} · {INR(inr(r.net))}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
+              {tab === "past" && (
+                <p className="mt-2 max-w-[80ch] text-[13px] leading-normal text-mute">
+                  Shares sold is the whole number from each E*TRADE release. Tax
+                  is your rate times the vest. Anything left from the last share
+                  is cash in that month's salary. Blank rows are estimates,
+                  shown with ~.
+                </p>
+              )}
             </div>
-            <AddGrant
-              symbol={settings.symbol}
-              onAdd={(g) => setGrants((gs) => [...gs.filter((x) => x.id !== g.id), g])}
-            />
-          </>
-        )}
+          ) : tab === "fy" ? (
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse overflow-hidden rounded-lg border border-rule bg-card text-sm">
+                <thead>
+                  <tr>
+                    {[
+                      "Financial year",
+                      "Vests",
+                      "Vesting",
+                      "Sold",
+                      "Tax",
+                      "In salary",
+                      "You keep",
+                      "Status",
+                    ].map((h) => (
+                      <th
+                        key={h}
+                        scope="col"
+                        className="border-b border-rule bg-[#fafbfa] px-3.5 py-2.5 text-right text-[13px] font-semibold text-mute first:text-left"
+                      >
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {fy.map((f) => (
+                    <tr key={f.fy}>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-left">
+                        {f.fy}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                        {f.count}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                        {U(f.qty)}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                        {U(f.sold)}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                        {U(f.tax)}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                        {U(f.salary)}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                        {U(f.net)}
+                      </td>
+                      <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                        {f.fut === 0
+                          ? "Done"
+                          : f.past === 0
+                            ? "Upcoming"
+                            : "In progress"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="mt-2 max-w-[80ch] text-[13px] leading-normal text-mute">
+                April to March, matching Indian income tax years. Useful for
+                Schedule FA and ITR prep; use vest-date values from Form 16 when
+                filing.
+              </p>
+            </div>
+          ) : (
+            <>
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse overflow-hidden rounded-lg border border-rule bg-card text-sm">
+                  <thead>
+                    <tr>
+                      {[
+                        "Grant",
+                        "Granted on",
+                        "Granted",
+                        "Scheduled",
+                        "Vested",
+                        "Unvested",
+                        "Progress",
+                        "",
+                      ].map((h) => (
+                        <th
+                          key={h || "actions"}
+                          scope="col"
+                          className="border-b border-rule bg-[#fafbfa] px-3.5 py-2.5 text-right text-[13px] font-semibold text-mute first:text-left"
+                        >
+                          {h || <span className="sr-only">Actions</span>}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {grants.map((g) => {
+                      const t = today0();
+                      const sch = g.vests.reduce((a, v) => a + v.qty, 0);
+                      const vd = g.vests
+                        .filter((v) => {
+                          const d = toDate(v.date);
+                          return d != null && d <= t;
+                        })
+                        .reduce((a, v) => a + v.qty, 0);
+                      return (
+                        <tr key={g.id}>
+                          <td className="border-b border-rule px-3.5 py-2.5 text-left">
+                            {g.grantNumber}
+                          </td>
+                          <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                            {fmtDate(g.grantDate)}
+                          </td>
+                          <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                            {U(g.granted)}
+                          </td>
+                          <td
+                            className={`border-b border-rule px-3.5 py-2.5 text-right ${Math.abs(sch - g.granted) > 0.5 ? "text-tax" : ""}`}
+                          >
+                            {U(sch)}
+                          </td>
+                          <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                            {U(vd)}
+                          </td>
+                          <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                            {U(sch - vd)}
+                          </td>
+                          <td className="min-w-30 border-b border-rule px-3.5 py-2.5">
+                            <div
+                              className="h-2 rounded bg-rule"
+                              aria-hidden="true"
+                            >
+                              <div
+                                className="h-full rounded bg-got"
+                                style={{
+                                  width: `${sch ? (vd / sch) * 100 : 0}%`,
+                                }}
+                              />
+                            </div>
+                          </td>
+                          <td className="border-b border-rule px-3.5 py-2.5 text-right">
+                            <button
+                              type="button"
+                              className={`${btnGhost} ${btnSmall}`}
+                              onClick={() => {
+                                if (confirm(`Remove grant ${g.grantNumber}?`)) {
+                                  setGrants((gs) =>
+                                    gs.filter((x) => x.id !== g.id),
+                                  );
+                                }
+                              }}
+                            >
+                              Remove
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <AddGrant
+                symbol={settings.symbol}
+                onAdd={(g) =>
+                  setGrants((gs) => [...gs.filter((x) => x.id !== g.id), g])
+                }
+              />
+            </>
+          )}
+        </div>
       </section>
 
       <section className="mt-11">
         <details className="rounded-lg border border-rule bg-card px-4 py-3.5">
-          <summary className={`cursor-pointer font-bold ${focus}`}>Assumptions and data</summary>
+          <summary className={`cursor-pointer font-bold ${focus}`}>
+            Assumptions and data
+          </summary>
           <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-3">
             <label className="flex flex-col gap-1 text-[13px] text-mute">
               Ticker
@@ -938,7 +1150,11 @@ export function Dashboard() {
                 onChange={(e) =>
                   setSettings((s) =>
                     s
-                      ? { ...s, symbol: e.target.value.toUpperCase(), fetchedAt: null }
+                      ? {
+                          ...s,
+                          symbol: e.target.value.toUpperCase(),
+                          fetchedAt: null,
+                        }
                       : s,
                   )
                 }
@@ -976,7 +1192,8 @@ export function Dashboard() {
                     s
                       ? {
                           ...s,
-                          usdinr: e.target.value === "" ? null : +e.target.value,
+                          usdinr:
+                            e.target.value === "" ? null : +e.target.value,
                           manualPrice: true,
                         }
                       : s,
@@ -992,7 +1209,9 @@ export function Dashboard() {
                 step="0.1"
                 value={settings.taxRate}
                 onChange={(e) =>
-                  setSettings((s) => (s ? { ...s, taxRate: +e.target.value } : s))
+                  setSettings((s) =>
+                    s ? { ...s, taxRate: +e.target.value } : s,
+                  )
                 }
               />
             </label>
@@ -1001,27 +1220,40 @@ export function Dashboard() {
                 type="checkbox"
                 checked={settings.useHistRate}
                 onChange={(e) =>
-                  setSettings((s) => (s ? { ...s, useHistRate: e.target.checked } : s))
+                  setSettings((s) =>
+                    s ? { ...s, useHistRate: e.target.checked } : s,
+                  )
                 }
               />
               Estimate future sales from shares sold so far
-              {histRate != null ? ` (${(histRate * 100).toFixed(1)}% sold)` : ""}
+              {histRate != null
+                ? ` (${(histRate * 100).toFixed(1)}% sold)`
+                : ""}
             </label>
           </div>
           <p className="mt-2 max-w-[80ch] text-[13px] leading-normal text-mute">
-            Common Indian rates: 31.2% (30% slab + 4% cess), 34.32% (10% surcharge, income ₹50L to ₹1Cr), 35.88% (15% surcharge, ₹1Cr to ₹2Cr), 39% (25% surcharge, above ₹2Cr). A fraction of a share still sells one whole share; the unused cash is paid in salary.
-            USD/INR is the live spot quote, the same interbank rate E*TRADE uses, not the SBI rate on your tax return.
-            Typing a price or a rate pauses automatic updates until you click Refresh price.{" "}
+            Common Indian rates: 31.2% (30% slab + 4% cess), 34.32% (10%
+            surcharge, income ₹50L to ₹1Cr), 35.88% (15% surcharge, ₹1Cr to
+            ₹2Cr), 39% (25% surcharge, above ₹2Cr). A fraction of a share still
+            sells one whole share; the unused cash is paid in salary. USD/INR is
+            the live spot quote, the same interbank rate E*TRADE uses, not the
+            SBI rate on your tax return. Typing a price or a rate pauses
+            automatic updates until you click Refresh price.{" "}
             {settings.asOf ? `Source: ${settings.asOf}.` : ""}
           </p>
           <p className="mt-2 max-w-[80ch] text-[13px] leading-normal text-mute">
-            Data file: <code className="rounded bg-[#eef1ee] px-1">{meta.dataFile}</code>. A daily copy is kept in the backups folder next to it.
+            The ledger stays in this browser. Download a backup if you want a
+            copy you can restore later. Nothing is saved on the server.
           </p>
           <div className="mt-3 flex flex-wrap items-center gap-2.5">
             <button type="button" className={btnGhost} onClick={exportBackup}>
               Download backup
             </button>
-            <button type="button" className={btnGhost} onClick={() => backupRef.current?.click()}>
+            <button
+              type="button"
+              className={btnGhost}
+              onClick={() => backupRef.current?.click()}
+            >
               Restore backup
             </button>
             <input
@@ -1038,7 +1270,8 @@ export function Dashboard() {
               type="button"
               className={btnGhost}
               onClick={() => {
-                if (confirm("Delete all grants from this dashboard?")) setGrants([]);
+                if (confirm("Delete all grants from this dashboard?"))
+                  setGrants([]);
               }}
             >
               Clear all grants
@@ -1074,7 +1307,11 @@ function AddGrant({
   if (!open) {
     return (
       <div className="mt-4">
-        <button type="button" className={btnGhost} onClick={() => setOpen(true)}>
+        <button
+          type="button"
+          className={btnGhost}
+          onClick={() => setOpen(true)}
+        >
           Add a grant manually
         </button>
       </div>
@@ -1084,23 +1321,46 @@ function AddGrant({
     <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-3 rounded-lg border border-rule bg-card p-4">
       <label className="flex flex-col gap-1 text-[13px] text-mute">
         Grant number
-        <input className={field} value={f.grantNumber} onChange={(e) => setF({ ...f, grantNumber: e.target.value })} />
+        <input
+          className={field}
+          value={f.grantNumber}
+          onChange={(e) => setF({ ...f, grantNumber: e.target.value })}
+        />
       </label>
       <label className="flex flex-col gap-1 text-[13px] text-mute">
         Grant date
-        <input className={field} type="date" value={f.grantDate} onChange={(e) => setF({ ...f, grantDate: e.target.value })} />
+        <input
+          className={field}
+          type="date"
+          value={f.grantDate}
+          onChange={(e) => setF({ ...f, grantDate: e.target.value })}
+        />
       </label>
       <label className="flex flex-col gap-1 text-[13px] text-mute">
         Total shares
-        <input className={field} type="number" value={f.total} onChange={(e) => setF({ ...f, total: e.target.value })} />
+        <input
+          className={field}
+          type="number"
+          value={f.total}
+          onChange={(e) => setF({ ...f, total: e.target.value })}
+        />
       </label>
       <label className="flex flex-col gap-1 text-[13px] text-mute">
         First vest date
-        <input className={field} type="date" value={f.first} onChange={(e) => setF({ ...f, first: e.target.value })} />
+        <input
+          className={field}
+          type="date"
+          value={f.first}
+          onChange={(e) => setF({ ...f, first: e.target.value })}
+        />
       </label>
       <label className="flex flex-col gap-1 text-[13px] text-mute">
         Vests every
-        <select className={field} value={f.every} onChange={(e) => setF({ ...f, every: Number(e.target.value) })}>
+        <select
+          className={field}
+          value={f.every}
+          onChange={(e) => setF({ ...f, every: Number(e.target.value) })}
+        >
           <option value={1}>month</option>
           <option value={3}>quarter</option>
           <option value={6}>6 months</option>
@@ -1109,7 +1369,12 @@ function AddGrant({
       </label>
       <label className="flex flex-col gap-1 text-[13px] text-mute">
         Number of vests
-        <input className={field} type="number" value={f.count} onChange={(e) => setF({ ...f, count: e.target.value })} />
+        <input
+          className={field}
+          type="number"
+          value={f.count}
+          onChange={(e) => setF({ ...f, count: e.target.value })}
+        />
       </label>
       <div className="flex items-end gap-2.5">
         <button
@@ -1124,7 +1389,12 @@ function AddGrant({
               symbol,
               granted: total,
               withheldTotal: 0,
-              vests: genSchedule({ total, first: f.first, every: f.every, count }),
+              vests: genSchedule({
+                total,
+                first: f.first,
+                every: f.every,
+                count,
+              }),
             });
             setOpen(false);
             setF(blank);
@@ -1132,7 +1402,11 @@ function AddGrant({
         >
           Add grant
         </button>
-        <button type="button" className={btnGhost} onClick={() => setOpen(false)}>
+        <button
+          type="button"
+          className={btnGhost}
+          onClick={() => setOpen(false)}
+        >
           Cancel
         </button>
       </div>
